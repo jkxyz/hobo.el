@@ -13,3 +13,4 @@ axum = { version = "0.8.1", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }
 tower = { version = "0.5.2", features = ["util"] }
 tower-http = { version = "0.6.2", features = ["fs"] }
+futures-util = "0.3.31"

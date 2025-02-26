@@ -6,10 +6,18 @@ use emacs::{defun, Env, Result, Value};
 use futures_util::{sink::SinkExt, stream::StreamExt};
 use std::{sync::Mutex, time::Duration};
 use tokio::sync::{broadcast, mpsc};
-use tokio::time::interval;
 use tower_http::services::ServeDir;
 
-emacs::use_symbols!(hobo_public_path hobo_server_bind_address symbol_value);
+emacs::use_symbols!(hobo_public_path
+                    hobo_server_bind_address
+                    symbol_value
+                    get_buffer_create
+                    switch_to_buffer
+                    make_local_variable
+                    add_hook
+                    after_change_functions
+                    hobors_handle_buffer_change
+                    buffer_string);
 
 emacs::plugin_is_GPL_compatible!();
 
@@ -41,43 +49,47 @@ fn start(env: &Env) -> Result<Value<'_>> {
     }
 
     let runtime = tokio::runtime::Runtime::new().unwrap();
+
     let public_path: String = get_symbol_value(env, hobo_public_path)?;
     let bind_address: String = get_symbol_value(env, hobo_server_bind_address)?;
     let bind_address_clone = bind_address.clone();
 
-    let (tx, _rx) = broadcast::channel::<String>(100);
-    let tx_clone = tx.clone();
+    let (tx, _) = broadcast::channel::<String>(100);
 
-    runtime.spawn(async move {
-        let mut counter = 0;
-        let mut interval = interval(Duration::from_secs(5));
+    {
+        let tx = tx.clone();
 
-        loop {
-            interval.tick().await;
-            let message = format!("Test broadcast message #{}", counter);
-            let _ = tx_clone.send(message);
-            counter += 1;
-        }
-    });
+        runtime.spawn(async move {
+            let app = Router::new()
+                .route(
+                    "/ws",
+                    axum::routing::get(move |ws: WebSocketUpgrade| {
+                        let tx = tx.clone();
+                        async move { ws.on_upgrade(move |socket| handle_websocket(socket, tx)) }
+                    }),
+                )
+                .fallback_service(ServeDir::new(public_path));
 
-    let tx_for_router = tx.clone();
-
-    runtime.spawn(async move {
-        let app = Router::new()
-            .route(
-                "/ws",
-                axum::routing::get(move |ws: WebSocketUpgrade| {
-                    let tx = tx_for_router.clone();
-                    async move { ws.on_upgrade(move |socket| handle_websocket(socket, tx)) }
-                }),
-            )
-            .fallback_service(ServeDir::new(public_path));
-
-        let listener = tokio::net::TcpListener::bind(&bind_address).await.unwrap();
-        axum::serve(listener, app).await.unwrap();
-    });
+            let listener = tokio::net::TcpListener::bind(&bind_address).await.unwrap();
+            axum::serve(listener, app).await.unwrap();
+        });
+    }
 
     *state = Some(State { runtime, tx });
+
+    let buffer = get_buffer_create.call(env, ("*hobo*",))?;
+    switch_to_buffer.call(env, (buffer,))?;
+    make_local_variable.call(env, (after_change_functions,))?;
+    add_hook.call(
+        env,
+        (
+            after_change_functions,
+            hobors_handle_buffer_change,
+            false,
+            true,
+        ),
+    )?;
+
     env.message(format!("HOBO started on {}", bind_address_clone))
 }
 
@@ -126,5 +138,18 @@ async fn handle_websocket(socket: WebSocket, tx: broadcast::Sender<String>) {
         _ = ws_sender_task => {},
         _ = broadcast_task => {},
         _ = receive_task => {},
+    }
+}
+
+#[defun]
+fn handle_buffer_change(env: &Env, begin: u8, end: u8, length: u8) -> Result<()> {
+    let state = STATE.lock().unwrap();
+
+    if let Some(State { tx, .. }) = state.as_ref() {
+        let content: String = buffer_string.call(env, [])?.into_rust()?;
+        tx.send(content)?;
+        Ok(())
+    } else {
+        Err(emacs::Error::msg("HOBO not started"))
     }
 }

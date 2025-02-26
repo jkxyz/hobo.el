@@ -1,8 +1,10 @@
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 use axum::Router;
 use emacs::{defun, Env, Result, Value};
 use tower_http::services::ServeDir;
+
+emacs::use_symbols!(hobo_public_path hobo_server_bind_address symbol_value);
 
 emacs::plugin_is_GPL_compatible!();
 
@@ -12,19 +14,8 @@ struct State {
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
-static PUBLIC_PATH: OnceLock<String> = OnceLock::new();
-
-fn get_symbol_value<'a, T: emacs::FromLisp<'a>>(env: &'a Env, name: &str) -> Result<T> {
-    env.call("symbol-value", (env.intern(name)?,))?
-        .into_rust::<T>()
-}
-
 #[emacs::module(name = "hobors")]
-fn init(env: &Env) -> Result<()> {
-    PUBLIC_PATH
-        .set(get_symbol_value(env, "hobo-public-path")?)
-        .unwrap();
-
+fn init(_env: &Env) -> Result<()> {
     Ok(())
 }
 
@@ -38,17 +29,19 @@ fn start(env: &Env) -> Result<Value<'_>> {
 
     let runtime = tokio::runtime::Runtime::new().unwrap();
 
+    let public_path: String = get_symbol_value(env, hobo_public_path)?;
+    let bind_address: String = get_symbol_value(env, hobo_server_bind_address)?;
+    let bind_address_clone = bind_address.clone();
+
     runtime.spawn(async {
-        let app = Router::new().fallback_service(ServeDir::new(PUBLIC_PATH.get().unwrap()));
-
-        let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-
+        let app = Router::new().fallback_service(ServeDir::new(public_path));
+        let listener = tokio::net::TcpListener::bind(bind_address).await.unwrap();
         axum::serve(listener, app).await.unwrap();
     });
 
     *state = Some(State { runtime });
 
-    env.message("HOBO started on localhost:3000")
+    env.message(format!("HOBO started on {}", bind_address_clone))
 }
 
 #[defun]
@@ -60,4 +53,11 @@ fn stop(env: &Env) -> Result<Value<'_>> {
     }
 
     env.message("HOBO stopped")
+}
+
+fn get_symbol_value<'a, T: emacs::FromLisp<'a>>(
+    env: &'a Env,
+    symbol: impl emacs::IntoLisp<'a>,
+) -> Result<T> {
+    symbol_value.call(env, (symbol,))?.into_rust()
 }

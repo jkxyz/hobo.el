@@ -1,4 +1,4 @@
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use axum::Router;
 use emacs::{defun, Env, Result, Value};
@@ -12,11 +12,19 @@ struct State {
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
-// TODO Make this a custom variable in Emacs
-static PUBLIC_PATH: &str = "C:/Users/josh/Code/hobo/public";
+static PUBLIC_PATH: OnceLock<String> = OnceLock::new();
+
+fn get_symbol_value<'a, T: emacs::FromLisp<'a>>(env: &'a Env, name: &str) -> Result<T> {
+    env.call("symbol-value", (env.intern(name)?,))?
+        .into_rust::<T>()
+}
 
 #[emacs::module(name = "hobors")]
-fn init(_env: &Env) -> Result<()> {
+fn init(env: &Env) -> Result<()> {
+    PUBLIC_PATH
+        .set(get_symbol_value(env, "hobo-public-path")?)
+        .unwrap();
+
     Ok(())
 }
 
@@ -31,7 +39,7 @@ fn start(env: &Env) -> Result<Value<'_>> {
     let runtime = tokio::runtime::Runtime::new().unwrap();
 
     runtime.spawn(async {
-        let app = Router::new().fallback_service(ServeDir::new(PUBLIC_PATH));
+        let app = Router::new().fallback_service(ServeDir::new(PUBLIC_PATH.get().unwrap()));
 
         let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
 

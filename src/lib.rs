@@ -1,7 +1,8 @@
 use std::sync::Mutex;
 
-use axum::{routing::get, Router};
+use axum::Router;
 use emacs::{defun, Env, Result, Value};
+use tower_http::services::ServeDir;
 
 emacs::plugin_is_GPL_compatible!();
 
@@ -11,9 +12,12 @@ struct State {
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
-#[emacs::module]
-fn init(env: &Env) -> Result<Value<'_>> {
-    env.message("HOBO module loaded")
+// TODO Make this a custom variable in Emacs
+static PUBLIC_PATH: &str = "C:/Users/josh/Code/hobo/public";
+
+#[emacs::module(name = "hobors")]
+fn init(_env: &Env) -> Result<()> {
+    Ok(())
 }
 
 #[defun]
@@ -27,8 +31,10 @@ fn start(env: &Env) -> Result<Value<'_>> {
     let runtime = tokio::runtime::Runtime::new().unwrap();
 
     runtime.spawn(async {
-        let app = Router::new().route("/", get(|| async { "Hello, World!" }));
+        let app = Router::new().fallback_service(ServeDir::new(PUBLIC_PATH));
+
         let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+
         axum::serve(listener, app).await.unwrap();
     });
 

@@ -1,7 +1,8 @@
-use std::sync::Mutex;
+use std::{sync::Mutex, time::Duration};
 
-use axum::Router;
+use axum::{extract::ws::Message, Router};
 use emacs::{defun, Env, Result, Value};
+use tokio::time::sleep;
 use tower_http::services::ServeDir;
 
 emacs::use_symbols!(hobo_public_path hobo_server_bind_address symbol_value);
@@ -34,8 +35,17 @@ fn start(env: &Env) -> Result<Value<'_>> {
     let bind_address_clone = bind_address.clone();
 
     runtime.spawn(async {
-        let app = Router::new().fallback_service(ServeDir::new(public_path));
+        let app = Router::new()
+            .route(
+                "/ws",
+                axum::routing::get(move |ws: axum::extract::ws::WebSocketUpgrade| async move {
+                    ws.on_upgrade(move |socket| handle_websocket(socket))
+                }),
+            )
+            .fallback_service(ServeDir::new(public_path));
+
         let listener = tokio::net::TcpListener::bind(bind_address).await.unwrap();
+
         axum::serve(listener, app).await.unwrap();
     });
 
@@ -53,6 +63,16 @@ fn stop(env: &Env) -> Result<Value<'_>> {
     }
 
     env.message("HOBO stopped")
+}
+
+async fn handle_websocket(mut socket: axum::extract::ws::WebSocket) {
+    loop {
+        if socket.send(Message::text("OK")).await.is_err() {
+            return;
+        }
+
+        sleep(Duration::from_secs(1)).await;
+    }
 }
 
 fn get_symbol_value<'a, T: emacs::FromLisp<'a>>(

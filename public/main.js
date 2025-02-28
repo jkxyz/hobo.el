@@ -1,5 +1,7 @@
-const ws = new WebSocket("/ws");
+import * as Y from "https://esm.run/yjs";
 
-ws.addEventListener("message", (event) => {
-  output.innerText = event.data;
+const socket = new WebSocket("/ws");
+
+socket.addEventListener("message", (event) => {
+  $output.innerText = event.data;
 });

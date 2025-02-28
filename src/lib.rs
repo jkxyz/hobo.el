@@ -1,4 +1,8 @@
-use std::sync::OnceLock;
+use std::{
+    future::IntoFuture,
+    sync::OnceLock,
+    time::{Duration, Instant},
+};
 
 use axum::{
     extract::{ws::WebSocket, WebSocketUpgrade},
@@ -14,10 +18,6 @@ emacs::use_symbols!(hobo_public_path
                     hobo_server_bind_address
                     hobo_display_error
                     symbol_value);
-
-emacs::define_errors! {
-    hobo_error "Hobo error"
-}
 
 struct HoboState {
     runtime: tokio::runtime::Runtime,
@@ -93,6 +93,7 @@ fn stop(env: &emacs::Env) -> emacs::Result<()> {
         ..
     } = get_state()?;
 
+    // TODO Shutdown runtime instead
     runtime.block_on(async {
         if let Some(server_task) = server_task.lock().await.take() {
             server_task.abort();
@@ -105,20 +106,34 @@ fn stop(env: &emacs::Env) -> emacs::Result<()> {
 }
 
 #[emacs::defun]
-fn last_error(env: &emacs::Env) -> emacs::Result<emacs::Value<'_>> {
+fn get_new_errors(env: &emacs::Env) -> emacs::Result<emacs::Value<'_>> {
     let HoboState {
         runtime, errors_rx, ..
     } = get_state()?;
 
     let mut errors_rx = runtime.block_on(errors_rx.lock());
 
-    match errors_rx.try_recv() {
-        Ok(err) => Ok(format!("{}", err).into_lisp(env)?),
-        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => Ok(false.into_lisp(env)?),
-        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-            Ok("Errors channel closed".into_lisp(env)?)
+    let deadline = Instant::now() + Duration::from_millis(100);
+    let mut errors = Vec::<anyhow::Error>::new();
+
+    while Instant::now() < deadline {
+        match errors_rx.try_recv() {
+            Ok(err) => {
+                errors.push(err);
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                errors.push(anyhow::anyhow!("Errors channel closed unexpectedly"));
+            }
         }
     }
+
+    let error_lisp_strings = errors
+        .into_iter()
+        .map(|err| err.to_string().into_lisp(env))
+        .collect::<emacs::Result<Vec<emacs::Value<'_>>>>()?;
+
+    env.list(&error_lisp_strings)
 }
 
 fn router(public_path: String) -> Router {

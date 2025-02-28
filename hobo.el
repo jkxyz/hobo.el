@@ -12,27 +12,35 @@
   (let ((buf (get-buffer-create "*hobo errors*")))
     (with-current-buffer buf
       (goto-char (point-max))
-      (insert (format "%s\n" msg)))
+      (insert (format "%s: %s\n" (current-time-string) msg)))
     (display-buffer buf)))
 
 (require 'hobors)
 
+(defvar hobo-errors-thread nil)
+
 (defun hobo--display-errors-loop ()
-  (let ((err (hobors--last-error)))
-    (when err
-      (hobo-display-error err))
+  (dolist (err (hobors--get-new-errors))
+    (hobo-display-error err))
+  (when hobo-errors-thread
     (run-with-idle-timer 0 nil #'hobo--display-errors-loop)))
 
-(defvar hobo-errors-thread
-  (make-thread 'hobo--display-errors-loop))
+(defun hobo--start-errors-thread ()
+  (setq hobo-errors-thread (make-thread 'hobo--display-errors-loop "hobo errors")))
+
+(defun hobo--stop-errors-thread ()
+  (thread-signal hobo-errors-thread 'quit nil)
+  (setq hobo-errors-thread nil))
 
 (defun hobo-start ()
   "Start the HOBO server."
   (interactive)
-  (hobors--start))
+  (hobors--start)
+  (hobo--start-errors-thread))
 
 (defun hobo-stop ()
   (interactive)
-  (hobors--stop))
+  (hobors--stop)
+  (hobo--stop-errors-thread))
 
 (provide 'hobo)

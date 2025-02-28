@@ -1,155 +1,148 @@
-use axum::{
-    extract::ws::{Message, WebSocket, WebSocketUpgrade},
-    Router,
-};
-use emacs::{defun, Env, Result, Value};
-use futures_util::{sink::SinkExt, stream::StreamExt};
-use std::{sync::Mutex, time::Duration};
-use tokio::sync::{broadcast, mpsc};
-use tower_http::services::ServeDir;
+use std::sync::OnceLock;
 
-emacs::use_symbols!(hobo_public_path
-                    hobo_server_bind_address
-                    symbol_value
-                    get_buffer_create
-                    switch_to_buffer
-                    make_local_variable
-                    add_hook
-                    after_change_functions
-                    hobors_handle_buffer_change
-                    buffer_string);
+use axum::{
+    extract::{ws::WebSocket, WebSocketUpgrade},
+    routing, Router,
+};
+use emacs::IntoLisp;
+use tokio::net::TcpListener;
+use tower_http::services::ServeDir;
 
 emacs::plugin_is_GPL_compatible!();
 
-struct State {
-    runtime: tokio::runtime::Runtime,
-    tx: broadcast::Sender<String>,
+emacs::use_symbols!(hobo_public_path
+                    hobo_server_bind_address
+                    hobo_display_error
+                    symbol_value);
+
+emacs::define_errors! {
+    hobo_error "Hobo error"
 }
 
-static STATE: Mutex<Option<State>> = Mutex::new(None);
+struct HoboState {
+    runtime: tokio::runtime::Runtime,
+    errors_tx: tokio::sync::mpsc::Sender<anyhow::Error>,
+    errors_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<anyhow::Error>>,
+    server_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
 
-#[emacs::module(name = "hobors")]
-fn init(_env: &Env) -> Result<()> {
+static STATE: OnceLock<HoboState> = OnceLock::new();
+
+#[emacs::module(name = "hobors", separator = "--")]
+fn init(_env: &emacs::Env) -> emacs::Result<()> {
+    let runtime = tokio::runtime::Runtime::new()?;
+
+    let (errors_tx, errors_rx) = tokio::sync::mpsc::channel::<anyhow::Error>(100);
+
+    STATE
+        .set(HoboState {
+            runtime,
+            errors_tx,
+            errors_rx: tokio::sync::Mutex::new(errors_rx),
+            server_task: tokio::sync::Mutex::new(None),
+        })
+        .map_err(|_| anyhow::anyhow!("Failed to initialize global state: already initialized"))?;
+
     Ok(())
 }
 
-fn get_symbol_value<'a, T: emacs::FromLisp<'a>>(
-    env: &'a Env,
-    symbol: impl emacs::IntoLisp<'a>,
-) -> Result<T> {
-    symbol_value.call(env, (symbol,))?.into_rust()
-}
+#[emacs::defun]
+fn start(env: &emacs::Env) -> emacs::Result<()> {
+    let HoboState {
+        runtime,
+        errors_tx,
+        server_task,
+        ..
+    } = get_state()?;
 
-#[defun]
-fn start(env: &Env) -> Result<Value<'_>> {
-    let mut state = STATE.lock().unwrap();
+    let public_path = get_symbol_value::<String>(env, hobo_public_path)?;
+    let bind_address = get_symbol_value::<String>(env, hobo_server_bind_address)?;
+    let router = router(public_path);
 
-    if state.is_some() {
-        return env.message("HOBO already started");
-    }
+    runtime.block_on(async {
+        let mut server_task = server_task.lock().await;
 
-    let runtime = tokio::runtime::Runtime::new().unwrap();
-
-    let public_path: String = get_symbol_value(env, hobo_public_path)?;
-    let bind_address: String = get_symbol_value(env, hobo_server_bind_address)?;
-    let bind_address_clone = bind_address.clone();
-
-    let (tx, _) = broadcast::channel::<String>(100);
-
-    {
-        let tx = tx.clone();
-
-        runtime.spawn(async move {
-            let app = Router::new()
-                .route(
-                    "/ws",
-                    axum::routing::get(move |ws: WebSocketUpgrade| {
-                        let tx = tx.clone();
-                        async move { ws.on_upgrade(move |socket| handle_websocket(socket, tx)) }
-                    }),
-                )
-                .fallback_service(ServeDir::new(public_path));
-
-            let listener = tokio::net::TcpListener::bind(&bind_address).await.unwrap();
-            axum::serve(listener, app).await.unwrap();
-        });
-    }
-
-    *state = Some(State { runtime, tx });
-
-    let buffer = get_buffer_create.call(env, ("*hobo*",))?;
-    switch_to_buffer.call(env, (buffer,))?;
-    make_local_variable.call(env, (after_change_functions,))?;
-    add_hook.call(
-        env,
-        (
-            after_change_functions,
-            hobors_handle_buffer_change,
-            false,
-            true,
-        ),
-    )?;
-
-    env.message(format!("HOBO started on {}", bind_address_clone))
-}
-
-#[defun]
-fn stop(env: &Env) -> Result<Value<'_>> {
-    let mut state = STATE.lock().unwrap();
-    if let Some(State { runtime, .. }) = state.take() {
-        runtime.shutdown_timeout(Duration::from_secs(5));
-        env.message("HOBO stopped")
-    } else {
-        env.message("HOBO not running")
-    }
-}
-
-async fn handle_websocket(socket: WebSocket, tx: broadcast::Sender<String>) {
-    let (mut ws_sender, mut ws_receiver) = socket.split();
-    let mut rx = tx.subscribe();
-    let (internal_tx, mut internal_rx) = mpsc::channel::<String>(32);
-
-    let ws_sender_task = tokio::spawn(async move {
-        while let Some(msg) = internal_rx.recv().await {
-            if ws_sender.send(Message::text(msg)).await.is_err() {
-                break;
-            }
+        if server_task.is_some() {
+            return Err(anyhow::anyhow!("Hobo already running"));
         }
-    });
 
-    let broadcast_task = {
-        let internal_tx = internal_tx.clone();
-        tokio::spawn(async move {
-            while let Ok(msg) = rx.recv().await {
-                if internal_tx.send(msg).await.is_err() {
-                    break;
-                }
+        let listener = TcpListener::bind(bind_address).await?;
+
+        server_task.replace(runtime.spawn(async move {
+            if let Err(err) = axum::serve(listener, router).await {
+                errors_tx.send(anyhow::anyhow!(err)).await.unwrap();
             }
-        })
-    };
+        }));
 
-    let receive_task = tokio::spawn(async move {
-        while let Some(Ok(msg)) = ws_receiver.next().await {
-            todo!()
-        }
-    });
-
-    tokio::select! {
-        _ = ws_sender_task => {},
-        _ = broadcast_task => {},
-        _ = receive_task => {},
-    }
-}
-
-#[defun]
-fn handle_buffer_change(env: &Env, begin: u8, end: u8, length: u8) -> Result<()> {
-    let state = STATE.lock().unwrap();
-
-    if let Some(State { tx, .. }) = state.as_ref() {
-        let content: String = buffer_string.call(env, [])?.into_rust()?;
-        tx.send(content)?;
         Ok(())
-    } else {
-        Err(emacs::Error::msg("HOBO not started"))
+    })?;
+
+    env.message(format!(
+        "Hobo started on {}",
+        get_symbol_value::<String>(env, hobo_server_bind_address)?
+    ))?;
+
+    Ok(())
+}
+
+#[emacs::defun]
+fn stop(env: &emacs::Env) -> emacs::Result<()> {
+    let HoboState {
+        runtime,
+        server_task,
+        ..
+    } = get_state()?;
+
+    runtime.block_on(async {
+        if let Some(server_task) = server_task.lock().await.take() {
+            server_task.abort();
+        }
+    });
+
+    env.message("Hobo stopped")?;
+
+    Ok(())
+}
+
+#[emacs::defun]
+fn last_error(env: &emacs::Env) -> emacs::Result<emacs::Value<'_>> {
+    let HoboState {
+        runtime, errors_rx, ..
+    } = get_state()?;
+
+    let mut errors_rx = runtime.block_on(errors_rx.lock());
+
+    match errors_rx.try_recv() {
+        Ok(err) => Ok(format!("{}", err).into_lisp(env)?),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => Ok(false.into_lisp(env)?),
+        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+            Ok("Errors channel closed".into_lisp(env)?)
+        }
     }
+}
+
+fn router(public_path: String) -> Router {
+    Router::new()
+        .route(
+            "/socket",
+            routing::get(|upgrade: WebSocketUpgrade| async {
+                upgrade.on_upgrade(|socket| handle_websocket(socket))
+            }),
+        )
+        .fallback_service(ServeDir::new(public_path))
+}
+
+async fn handle_websocket(socket: WebSocket) {}
+
+fn get_state<'a>() -> emacs::Result<&'a HoboState> {
+    STATE
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("State not initialized"))
+}
+
+fn get_symbol_value<'a, T: emacs::FromLisp<'a>>(
+    env: &'a emacs::Env,
+    symbol: impl emacs::IntoLisp<'a>,
+) -> emacs::Result<T> {
+    symbol_value.call(env, (symbol,))?.into_rust()
 }

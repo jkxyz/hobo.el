@@ -8,39 +8,29 @@
   :group 'hobo
   :type 'string)
 
-(defun hobo-display-error (msg)
-  (let ((buf (get-buffer-create "*hobo errors*")))
-    (with-current-buffer buf
-      (goto-char (point-max))
-      (insert (format "%s: %s\n" (current-time-string) msg)))
-    (display-buffer buf)))
-
 (require 'hobors)
 
-(defvar hobo-errors-thread nil)
+(defun hobo--display-log (log)
+  (let ((buf (get-buffer-create "*hobo logs*")))
+    (with-current-buffer buf
+      (goto-char (point-max))
+      (insert (format "%s\n" log)))
+    (display-buffer buf)))
 
-(defun hobo--display-errors-loop ()
-  (dolist (err (hobors--get-new-errors))
-    (hobo-display-error err))
-  (when hobo-errors-thread
-    (run-with-idle-timer 0 nil #'hobo--display-errors-loop)))
+(defun hobo--display-logs-loop ()
+  (dolist (log (hobors--consume-logs))
+    (hobo--display-log log))
+  (run-with-idle-timer 0 nil #'hobo--display-logs-loop))
 
-(defun hobo--start-errors-thread ()
-  (setq hobo-errors-thread (make-thread 'hobo--display-errors-loop "hobo errors")))
-
-(defun hobo--stop-errors-thread ()
-  (thread-signal hobo-errors-thread 'quit nil)
-  (setq hobo-errors-thread nil))
+(hobo--display-logs-loop)
 
 (defun hobo-start ()
   "Start the HOBO server."
   (interactive)
-  (hobors--start)
-  (hobo--start-errors-thread))
+  (hobors--start))
 
 (defun hobo-stop ()
   (interactive)
-  (hobors--stop)
-  (hobo--stop-errors-thread))
+  (hobors--stop))
 
 (provide 'hobo)

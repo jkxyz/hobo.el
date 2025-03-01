@@ -17,17 +17,25 @@
       (insert (format "%s\n" log)))
     (display-buffer buf)))
 
-(defun hobo--display-logs-loop ()
-  (dolist (log (hobors--consume-logs))
-    (hobo--display-log log))
-  (run-with-idle-timer 0 nil #'hobo--display-logs-loop))
+(run-with-timer 0 1 (lambda ()
+                      (dolist (log (hobors--consume-logs))
+                        (hobo--display-log log))))
 
-(hobo--display-logs-loop)
+(defun hobo--buffer-after-change (start end length)
+  (let ((text (buffer-substring-no-properties start end)))
+    (hobors--update-buffer (buffer-name) (- start 1) length text)))
+
+(defun hobo-create-buffer ()
+  (let ((buf (get-buffer-create "*hobo*")))
+    (with-current-buffer buf
+      (add-hook 'after-change-functions 'hobo--buffer-after-change nil t)
+      (display-buffer buf))))
 
 (defun hobo-start ()
   "Start the HOBO server."
   (interactive)
-  (hobors--start))
+  (hobors--start)
+  (hobo-create-buffer))
 
 (defun hobo-stop ()
   (interactive)

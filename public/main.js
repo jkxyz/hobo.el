@@ -1,7 +1,18 @@
 import * as Y from "https://esm.run/yjs";
 
-const socket = new WebSocket("/ws");
+const doc = new Y.Doc();
+
+window.DOC = doc;
+
+const socket = new WebSocket("/socket");
+
+socket.addEventListener("open", (_) => {});
 
 socket.addEventListener("message", (event) => {
-  $output.innerText = event.data;
+  const message = JSON.parse(event.data);
+
+  if (message.type === "DIFF") {
+    Y.applyUpdate(doc, new Uint8Array(message.diff));
+    $output.innerText = doc.getText("*hobo*").toString();
+  }
 });

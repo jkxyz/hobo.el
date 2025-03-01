@@ -4,12 +4,18 @@ use std::{
 };
 
 use axum::{
-    extract::{ws::WebSocket, WebSocketUpgrade},
+    extract::{
+        ws::{Message, WebSocket},
+        WebSocketUpgrade,
+    },
     routing, Router,
 };
 use emacs::IntoLisp;
+use futures_util::{SinkExt, StreamExt};
+use serde_json::json;
 use tokio::net::TcpListener;
 use tower_http::services::ServeDir;
+use yrs::{ReadTxn, Text, Transact};
 
 emacs::plugin_is_GPL_compatible!();
 
@@ -22,20 +28,24 @@ struct HoboState {
     runtime: tokio::runtime::Runtime,
     logger: HoboLogger,
     server_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    doc: yrs::Doc,
 }
 
 static STATE: OnceLock<HoboState> = OnceLock::new();
 
+// TODO Initialize in the start function
 #[emacs::module(name = "hobors", separator = "--")]
 fn init(_env: &emacs::Env) -> emacs::Result<()> {
     let runtime = tokio::runtime::Runtime::new()?;
     let logger = HoboLogger::new();
+    let doc = yrs::Doc::new();
 
     STATE
         .set(HoboState {
             runtime,
             logger,
             server_task: tokio::sync::Mutex::new(None),
+            doc,
         })
         .map_err(|_| anyhow::anyhow!("Failed to initialize global state: already initialized"))?;
 
@@ -66,13 +76,6 @@ fn start(env: &emacs::Env) -> emacs::Result<()> {
         }
 
         let listener = TcpListener::bind(bind_address).await?;
-
-        runtime.spawn(async {
-            loop {
-                log::info!("Oops");
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        });
 
         server_task.replace(runtime.spawn(async move {
             if let Err(err) = axum::serve(listener, router).await {
@@ -124,6 +127,33 @@ fn consume_logs(env: &emacs::Env) -> emacs::Result<emacs::Value<'_>> {
     )
 }
 
+#[emacs::defun]
+fn update_buffer(
+    _env: &emacs::Env,
+    buffer_name: String,
+    start: u32,
+    length: u32,
+    text: String,
+) -> emacs::Result<()> {
+    let HoboState { doc, .. } = get_state()?;
+
+    let buffer = doc.get_or_insert_text(buffer_name.clone());
+
+    let mut txn = doc.transact_mut();
+
+    if length > 0 {
+        buffer.remove_range(&mut txn, start, length);
+    }
+
+    if text.len() > 0 {
+        buffer.insert(&mut txn, start, &text);
+    }
+
+    txn.commit();
+
+    Ok(())
+}
+
 fn router(public_path: String) -> Router {
     Router::new()
         .route(
@@ -135,7 +165,49 @@ fn router(public_path: String) -> Router {
         .fallback_service(ServeDir::new(public_path))
 }
 
-async fn handle_websocket(socket: WebSocket) {}
+async fn handle_websocket(socket: WebSocket) {
+    let HoboState { doc, .. } = get_state().unwrap();
+
+    let (mut sender, mut receiver) = socket.split();
+
+    let diff = doc.transact().encode_diff_v1(&yrs::StateVector::default());
+
+    sender
+        .send(Message::text(
+            json!({"type": "DIFF", "diff": diff}).to_string(),
+        ))
+        .await
+        .unwrap();
+
+    let (diffs_tx, mut diffs_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+
+    doc.observe_update_v1_with("foo", move |_txn, event| {
+        log::info!("Doc updated");
+        diffs_tx.send(event.update.to_owned()).unwrap();
+    })
+    .unwrap();
+
+    let sender_task = tokio::spawn(async move {
+        while let Some(diff) = diffs_rx.recv().await {
+            sender
+                .send(Message::text(
+                    json!({"type": "DIFF", "diff": diff}).to_string(),
+                ))
+                .await
+                .unwrap();
+        }
+    });
+
+    while let Some(Ok(msg)) = receiver.next().await {
+        match msg {
+            Message::Close(_) => break,
+            Message::Text(text) => {
+                log::info!("Message received: {}", text);
+            }
+            _ => continue,
+        }
+    }
+}
 
 fn get_state<'a>() -> emacs::Result<&'a HoboState> {
     STATE
@@ -150,6 +222,7 @@ fn get_symbol_value<'a, T: emacs::FromLisp<'a>>(
     symbol_value.call(env, (symbol,))?.into_rust()
 }
 
+// TODO Log via a TCP server and use make-network-process to filter logs asynchronously
 struct HoboLogger {
     tx: tokio::sync::mpsc::UnboundedSender<String>,
     rx: tokio::sync::RwLock<tokio::sync::mpsc::UnboundedReceiver<String>>,

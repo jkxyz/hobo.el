@@ -142,14 +142,6 @@ fn update_buffer(
 
     txn.commit();
 
-    log::debug!(
-        "Updated buffer {} - start: {}, length: {}, text: {}",
-        buffer_name,
-        start,
-        length,
-        text
-    );
-
     Ok(())
 }
 
@@ -216,18 +208,19 @@ async fn handle_websocket(socket: WebSocket) {
         }
     });
 
-    let client_messages_tx1 = client_messages_tx.clone();
-
     let client_messages_task = tokio::spawn(async move {
         while let Some(Ok(socket_message)) = socket_receiver.next().await {
             match socket_message {
                 axum::extract::ws::Message::Text(text) => {
                     match serde_json::from_str::<ClientMessage>(&text) {
                         Ok(message) => {
-                            if let Err(err) = client_messages_tx1.send(message) {
+                            log::debug!(message:?; "Received message");
+
+                            if let Err(err) = client_messages_tx.send(message) {
                                 log::error!(err:err; "Error sending client message");
                             }
                         }
+
                         Err(err) => {
                             log::error!(err:err; "Error parsing client message");
                         }
@@ -241,25 +234,33 @@ async fn handle_websocket(socket: WebSocket) {
         }
     });
 
-    let client_messages_tx2 = client_messages_tx.clone();
-
     let sync_task: tokio::task::JoinHandle<emacs::Result<()>> = tokio::spawn(async move {
         let initial_diff = doc.transact().encode_diff_v1(&yrs::StateVector::default());
 
         server_messages_tx.send(ServerMessage::Diff { diff: initial_diff })?;
 
-        doc.observe_update_v1(move |_txn, event| {
+        doc.observe_update_v1_with("foo", move |txn, event| {
+            if let Some(origin) = txn.origin() {
+                if *origin == yrs::Origin::from("client") {
+                    return;
+                }
+            }
+
             let diff = event.update.clone();
 
-            if let Err(err) = client_messages_tx2.send(ClientMessage::Diff { diff }) {
-                log::error!("Error handling document update: {}", err);
+            log::debug!("Document updated");
+
+            if let Err(err) = server_messages_tx.send(ServerMessage::Diff { diff }) {
+                log::error!(err:err; "Error handling document update");
+                return;
             }
         })?;
 
         while let Some(message) = client_messages_rx.recv().await {
             match message {
                 ClientMessage::Diff { diff } => {
-                    let mut txn = doc.transact_mut();
+                    log::debug!("Applying diff");
+                    let mut txn = doc.transact_mut_with("client");
                     txn.apply_update(yrs::Update::decode_v1(&diff)?)?;
                     txn.commit();
                 }
@@ -273,7 +274,7 @@ async fn handle_websocket(socket: WebSocket) {
         _ = server_messages_task => {}
         _ = client_messages_task => {}
         Err(err) = sync_task => {
-            log::error!("Error synchronizing with client: {}", err);
+            log::error!(err:err; "Error synchronizing with client");
         }
     }
 

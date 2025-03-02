@@ -1,5 +1,5 @@
-import * as Y from "https://esm.run/yjs";
-import { TextAreaBinding } from "https://esm.run/y-textarea";
+import * as Y from "https://cdn.skypack.dev/yjs";
+import { TextAreaBinding } from "https://cdn.skypack.dev/y-textarea";
 
 const doc = new Y.Doc();
 
@@ -17,10 +17,12 @@ socket.addEventListener("message", (event) => {
   const message = JSON.parse(event.data);
 
   if (message.type === "Diff") {
-    Y.applyUpdate(doc, new Uint8Array(message.diff));
+    Y.applyUpdate(doc, new Uint8Array(message.diff), "server");
   }
 });
 
 doc.on("update", (diff, origin) => {
-  socket.send(JSON.stringify({ type: "Diff", diff: Array.from(diff) }));
+  if (origin !== "server") {
+    socket.send(JSON.stringify({ type: "Diff", diff: Array.from(diff) }));
+  }
 });

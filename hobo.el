@@ -18,18 +18,42 @@
   (let ((buf (get-buffer-create "*hobo*")))
     (with-current-buffer buf
       (add-hook 'after-change-functions 'hobo--buffer-after-change nil t)
-      (display-buffer buf))))
+      (display-buffer buf '(display-buffer-same-window)))))
 
 (defvar hobo-logger-process nil)
 
 (defun hobo-init-logger ()
   (when (not hobo-logger-process)
-    (let ((addr (hobors--init-logger)))
+    (let ((addr (hobors--init-logger))
+          (log-buffer (get-buffer-create "*hobo logs*")))
+      (with-current-buffer log-buffer
+        (unless (eq major-mode 'special-mode)
+          (special-mode))
+        (setq buffer-read-only t)
+        (set (make-local-variable 'window-point-insertion-type) t))
       (setq hobo-logger-process
-            (make-network-process :name "hobo logger"
-                                  :buffer "*hobo logs*"
-                                  :host (nth 0 addr)
-                                  :service (nth 1 addr))))))
+            (make-network-process
+             :name "hobo logger"
+             :buffer log-buffer
+             :host (nth 0 addr)
+             :service (nth 1 addr)
+             :filter #'hobo-logger-filter)))))
+
+(defun hobo-logger-filter (proc string)
+  (when (buffer-live-p (process-buffer proc))
+    (with-current-buffer (process-buffer proc)
+      (let ((inhibit-read-only t)
+            (moving (= (point) (process-mark proc))))
+        (save-excursion
+          (goto-char (process-mark proc))
+          (insert string)
+          (set-marker (process-mark proc) (point)))
+        (when moving
+          (goto-char (process-mark proc)))))))
+
+(defun hobo-display-logs ()
+  (interactive)
+  (display-buffer "*hobo logs*"))
 
 (defun hobo-start ()
   "Start the HOBO server."

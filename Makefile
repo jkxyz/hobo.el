@@ -20,4 +20,4 @@ clean:
 	cargo clean
 
 run: all
-	emacs --eval "(hobo-start)"
+	emacs --eval '(progn (hobo-start) (hobo-display-logs))'

@@ -1,18 +1,16 @@
-use std::{
-    sync::OnceLock,
-    time::{Duration, Instant},
-};
+use std::sync::OnceLock;
 
 use axum::{
     extract::{ws::WebSocket, WebSocketUpgrade},
     routing, Router,
 };
-use emacs::IntoLisp;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tower_http::services::ServeDir;
 use yrs::{updates::decoder::Decode, ReadTxn, Text, Transact};
+
+mod logger;
 
 emacs::plugin_is_GPL_compatible!();
 
@@ -23,34 +21,43 @@ emacs::use_symbols!(hobo_public_path
 
 struct HoboState {
     runtime: tokio::runtime::Runtime,
-    logger: HoboLogger,
     server_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     doc: yrs::Doc,
 }
 
 static STATE: OnceLock<HoboState> = OnceLock::new();
 
+static LOGGER: OnceLock<logger::TcpLoggerServer> = OnceLock::new();
+
 // TODO Initialize in the start function
 #[emacs::module(name = "hobors", separator = "--")]
 fn init(_env: &emacs::Env) -> emacs::Result<()> {
     let runtime = tokio::runtime::Runtime::new()?;
-    let logger = HoboLogger::new();
     let doc = yrs::Doc::new();
 
     STATE
         .set(HoboState {
             runtime,
-            logger,
             server_task: tokio::sync::Mutex::new(None),
             doc,
         })
         .map_err(|_| anyhow::anyhow!("Failed to initialize global state: already initialized"))?;
 
-    log::set_logger(&STATE.get().unwrap().logger)
-        .map(|()| log::set_max_level(log::LevelFilter::Debug))
-        .map_err(|err| anyhow::anyhow!(err))?;
-
     Ok(())
+}
+
+#[emacs::defun]
+fn init_logger(env: &emacs::Env) -> emacs::Result<emacs::Value<'_>> {
+    let logger = logger::TcpLoggerServer::new()?;
+    let addr = logger.server_addr();
+
+    logger.init(log::LevelFilter::Debug)?;
+
+    LOGGER
+        .set(logger)
+        .map_err(|_| anyhow::anyhow!("Logger already initialized"))?;
+
+    env.list((addr.ip().to_string(), addr.port()))
 }
 
 #[emacs::defun]
@@ -109,19 +116,6 @@ fn stop(env: &emacs::Env) -> emacs::Result<()> {
     env.message("Hobo stopped")?;
 
     Ok(())
-}
-
-#[emacs::defun]
-fn consume_logs(env: &emacs::Env) -> emacs::Result<emacs::Value<'_>> {
-    let HoboState { logger, .. } = get_state()?;
-
-    env.list(
-        &logger
-            .consume_logs()
-            .into_iter()
-            .map(|log| log.into_lisp(env))
-            .collect::<emacs::Result<Vec<emacs::Value<'_>>>>()?,
-    )
 }
 
 #[emacs::defun]
@@ -218,7 +212,7 @@ async fn handle_websocket(socket: WebSocket) {
                 }
             };
 
-            log::debug!("Sent message: {:?}", message);
+            log::debug!(message:?; "Sent message");
         }
     });
 
@@ -231,11 +225,11 @@ async fn handle_websocket(socket: WebSocket) {
                     match serde_json::from_str::<ClientMessage>(&text) {
                         Ok(message) => {
                             if let Err(err) = client_messages_tx1.send(message) {
-                                log::error!("Error sending client message: {}", err);
+                                log::error!(err:err; "Error sending client message");
                             }
                         }
                         Err(err) => {
-                            log::error!("Error parsing client message: {}", err);
+                            log::error!(err:err; "Error parsing client message");
                         }
                     };
                 }
@@ -297,74 +291,4 @@ fn get_symbol_value<'a, T: emacs::FromLisp<'a>>(
     symbol: impl emacs::IntoLisp<'a>,
 ) -> emacs::Result<T> {
     symbol_value.call(env, (symbol,))?.into_rust()
-}
-
-// TODO Log via a TCP server and use make-network-process to filter logs asynchronously
-struct HoboLogger {
-    tx: tokio::sync::mpsc::UnboundedSender<String>,
-    rx: tokio::sync::RwLock<tokio::sync::mpsc::UnboundedReceiver<String>>,
-}
-
-impl log::Log for HoboLogger {
-    fn enabled(&self, _metadata: &log::Metadata) -> bool {
-        true
-    }
-
-    fn log(&self, record: &log::Record) {
-        if self.enabled(record.metadata()) {
-            self.tx.send(self.format_record(record)).unwrap();
-        }
-    }
-
-    fn flush(&self) {}
-}
-
-impl HoboLogger {
-    fn new() -> Self {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-
-        Self {
-            tx,
-            rx: tokio::sync::RwLock::new(rx),
-        }
-    }
-
-    fn format_record(&self, record: &log::Record) -> String {
-        format!(
-            "[{} {} {}] {}",
-            chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
-            record.level(),
-            record.module_path().unwrap_or("<unknown>"),
-            record.args()
-        )
-    }
-
-    fn consume_logs(&self) -> Vec<String> {
-        let mut rx = self.rx.blocking_write();
-        let mut logs = Vec::<String>::new();
-        let deadline = Instant::now() + Duration::from_millis(100);
-
-        while Instant::now() < deadline {
-            match rx.try_recv() {
-                Ok(log) => {
-                    logs.push(log);
-                }
-
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                    logs.push(
-                        self.format_record(
-                            &log::Record::builder()
-                                .level(log::Level::Error)
-                                .args(format_args!("Logger channel closed unexpectedly"))
-                                .build(),
-                        ),
-                    );
-                }
-
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-            }
-        }
-
-        logs
-    }
 }

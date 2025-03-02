@@ -16,11 +16,11 @@ socket.addEventListener("open", (_) => {});
 socket.addEventListener("message", (event) => {
   const message = JSON.parse(event.data);
 
-  if (message.type === "DIFF") {
+  if (message.type === "Diff") {
     Y.applyUpdate(doc, new Uint8Array(message.diff));
   }
 });
 
 doc.on("update", (diff, origin) => {
-  socket.send(JSON.stringify({ type: "DIFF", diff: Array.from(diff) }));
+  socket.send(JSON.stringify({ type: "Diff", diff: Array.from(diff) }));
 });

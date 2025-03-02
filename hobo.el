@@ -10,17 +10,6 @@
 
 (require 'hobors)
 
-(defun hobo--display-log (log)
-  (let ((buf (get-buffer-create "*hobo logs*")))
-    (with-current-buffer buf
-      (goto-char (point-max))
-      (insert (format "%s\n" log)))
-    (display-buffer buf)))
-
-(run-with-timer 0 1 (lambda ()
-                      (dolist (log (hobors--consume-logs))
-                        (hobo--display-log log))))
-
 (defun hobo--buffer-after-change (start end length)
   (let ((text (buffer-substring-no-properties start end)))
     (hobors--update-buffer (buffer-name) (- start 1) length text)))
@@ -31,9 +20,21 @@
       (add-hook 'after-change-functions 'hobo--buffer-after-change nil t)
       (display-buffer buf))))
 
+(defvar hobo-logger-process nil)
+
+(defun hobo-init-logger ()
+  (when (not hobo-logger-process)
+    (let ((addr (hobors--init-logger)))
+      (setq hobo-logger-process
+            (make-network-process :name "hobo logger"
+                                  :buffer "*hobo logs*"
+                                  :host (nth 0 addr)
+                                  :service (nth 1 addr))))))
+
 (defun hobo-start ()
   "Start the HOBO server."
   (interactive)
+  (hobo-init-logger)
   (hobors--start)
   (hobo-create-buffer))
 

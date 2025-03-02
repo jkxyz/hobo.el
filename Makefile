@@ -3,7 +3,7 @@ ifeq ($(OS),Windows_NT)
 		.SHELLFLAGS := -NoProfile -Command
 endif
 
-.PHONY: all clean
+.PHONY: all clean run
 
 all: hobors.dll
 
@@ -18,3 +18,6 @@ target/debug/hobors.dll: $(RUST_SOURCES) Cargo.toml
 clean:
 	Remove-Item -ErrorAction SilentlyContinue hobors.dll
 	cargo clean
+
+run: all
+	emacs --eval "(hobo-start)"

@@ -4,18 +4,15 @@ use std::{
 };
 
 use axum::{
-    extract::{
-        ws::{Message, WebSocket},
-        WebSocketUpgrade,
-    },
+    extract::{ws::WebSocket, WebSocketUpgrade},
     routing, Router,
 };
 use emacs::IntoLisp;
 use futures_util::{SinkExt, StreamExt};
-use serde_json::json;
+use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tower_http::services::ServeDir;
-use yrs::{ReadTxn, Text, Transact};
+use yrs::{updates::decoder::Decode, ReadTxn, Text, Transact};
 
 emacs::plugin_is_GPL_compatible!();
 
@@ -50,7 +47,7 @@ fn init(_env: &emacs::Env) -> emacs::Result<()> {
         .map_err(|_| anyhow::anyhow!("Failed to initialize global state: already initialized"))?;
 
     log::set_logger(&STATE.get().unwrap().logger)
-        .map(|()| log::set_max_level(log::LevelFilter::Info))
+        .map(|()| log::set_max_level(log::LevelFilter::Debug))
         .map_err(|err| anyhow::anyhow!(err))?;
 
     Ok(())
@@ -151,6 +148,14 @@ fn update_buffer(
 
     txn.commit();
 
+    log::debug!(
+        "Updated buffer {} - start: {}, length: {}, text: {}",
+        buffer_name,
+        start,
+        length,
+        text
+    );
+
     Ok(())
 }
 
@@ -165,48 +170,120 @@ fn router(public_path: String) -> Router {
         .fallback_service(ServeDir::new(public_path))
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(tag = "type")]
+enum ServerMessage {
+    Diff { diff: Vec<u8> },
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(tag = "type")]
+enum ClientMessage {
+    Diff { diff: Vec<u8> },
+}
+
 async fn handle_websocket(socket: WebSocket) {
-    let HoboState { doc, .. } = get_state().unwrap();
+    log::info!("Client connected");
 
-    let (mut sender, mut receiver) = socket.split();
+    let HoboState { doc, .. } = match get_state() {
+        Ok(state) => state,
+        Err(err) => {
+            log::error!("Error getting Hobo state: {}", err);
+            return;
+        }
+    };
 
-    let diff = doc.transact().encode_diff_v1(&yrs::StateVector::default());
+    let (mut socket_sender, mut socket_receiver) = socket.split();
 
-    sender
-        .send(Message::text(
-            json!({"type": "DIFF", "diff": diff}).to_string(),
-        ))
-        .await
-        .unwrap();
+    let (server_messages_tx, mut server_messages_rx) =
+        tokio::sync::mpsc::unbounded_channel::<ServerMessage>();
 
-    let (diffs_tx, mut diffs_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let (client_messages_tx, mut client_messages_rx) =
+        tokio::sync::mpsc::unbounded_channel::<ClientMessage>();
 
-    doc.observe_update_v1_with("foo", move |_txn, event| {
-        log::info!("Doc updated");
-        diffs_tx.send(event.update.to_owned()).unwrap();
-    })
-    .unwrap();
+    let server_messages_task = tokio::spawn(async move {
+        while let Some(message) = server_messages_rx.recv().await {
+            match serde_json::to_string(&message) {
+                Ok(text) => {
+                    if let Err(err) = socket_sender
+                        .send(axum::extract::ws::Message::text(text))
+                        .await
+                    {
+                        log::error!("Error sending server message: {}", err);
+                    }
+                }
+                Err(err) => {
+                    log::error!("Error serializing server message: {}", err);
+                    continue;
+                }
+            };
 
-    let sender_task = tokio::spawn(async move {
-        while let Some(diff) = diffs_rx.recv().await {
-            sender
-                .send(Message::text(
-                    json!({"type": "DIFF", "diff": diff}).to_string(),
-                ))
-                .await
-                .unwrap();
+            log::debug!("Sent message: {:?}", message);
         }
     });
 
-    while let Some(Ok(msg)) = receiver.next().await {
-        match msg {
-            Message::Close(_) => break,
-            Message::Text(text) => {
-                log::info!("Message received: {}", text);
+    let client_messages_tx1 = client_messages_tx.clone();
+
+    let client_messages_task = tokio::spawn(async move {
+        while let Some(Ok(socket_message)) = socket_receiver.next().await {
+            match socket_message {
+                axum::extract::ws::Message::Text(text) => {
+                    match serde_json::from_str::<ClientMessage>(&text) {
+                        Ok(message) => {
+                            if let Err(err) = client_messages_tx1.send(message) {
+                                log::error!("Error sending client message: {}", err);
+                            }
+                        }
+                        Err(err) => {
+                            log::error!("Error parsing client message: {}", err);
+                        }
+                    };
+                }
+
+                axum::extract::ws::Message::Close(_) => break,
+
+                _ => {}
             }
-            _ => continue,
+        }
+    });
+
+    let client_messages_tx2 = client_messages_tx.clone();
+
+    let sync_task: tokio::task::JoinHandle<emacs::Result<()>> = tokio::spawn(async move {
+        let initial_diff = doc.transact().encode_diff_v1(&yrs::StateVector::default());
+
+        server_messages_tx.send(ServerMessage::Diff { diff: initial_diff })?;
+
+        doc.observe_update_v1(move |_txn, event| {
+            let diff = event.update.clone();
+
+            if let Err(err) = client_messages_tx2.send(ClientMessage::Diff { diff }) {
+                log::error!("Error handling document update: {}", err);
+            }
+        })?;
+
+        while let Some(message) = client_messages_rx.recv().await {
+            match message {
+                ClientMessage::Diff { diff } => {
+                    let mut txn = doc.transact_mut();
+                    txn.apply_update(yrs::Update::decode_v1(&diff)?)?;
+                    txn.commit();
+                }
+            }
+        }
+
+        Ok(())
+    });
+
+    tokio::select! {
+        _ = server_messages_task => {}
+        _ = client_messages_task => {}
+        Err(err) = sync_task => {
+            log::error!("Error synchronizing with client: {}", err);
         }
     }
+
+    log::info!("Closing WebSocket");
 }
 
 fn get_state<'a>() -> emacs::Result<&'a HoboState> {
@@ -229,8 +306,8 @@ struct HoboLogger {
 }
 
 impl log::Log for HoboLogger {
-    fn enabled(&self, metadata: &log::Metadata) -> bool {
-        metadata.level() <= log::Level::Info
+    fn enabled(&self, _metadata: &log::Metadata) -> bool {
+        true
     }
 
     fn log(&self, record: &log::Record) {

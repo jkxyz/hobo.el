@@ -1,6 +1,11 @@
 import * as Y from "https://esm.run/yjs";
+import { TextAreaBinding } from "https://esm.run/y-textarea";
 
 const doc = new Y.Doc();
+
+const buffer = doc.getText("*hobo*");
+
+const binding = new TextAreaBinding(buffer, $output);
 
 window.DOC = doc;
 
@@ -13,6 +18,9 @@ socket.addEventListener("message", (event) => {
 
   if (message.type === "DIFF") {
     Y.applyUpdate(doc, new Uint8Array(message.diff));
-    $output.innerText = doc.getText("*hobo*").toString();
   }
+});
+
+doc.on("update", (diff, origin) => {
+  socket.send(JSON.stringify({ type: "DIFF", diff: Array.from(diff) }));
 });

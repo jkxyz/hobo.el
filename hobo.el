@@ -88,11 +88,16 @@
   (add-hook 'find-file-hook 'hobo--ensure-buffer-monitored)
   (add-hook 'after-change-major-mode-hook 'hobo--ensure-buffer-monitored)
 
-  (add-hook 'window-configuration-change-hook 
-            (lambda () 
-              (dolist (window (window-list))
-                (with-current-buffer (window-buffer window)
-                  (hobo--ensure-buffer-monitored))))))
+  (dolist (buffer (buffer-list))
+    (with-current-buffer buffer
+      (hobo--ensure-buffer-monitored)))
+
+  ;; (add-hook 'window-configuration-change-hook 
+  ;;           (lambda () 
+  ;;             (dolist (window (window-list))
+  ;;               (with-current-buffer (window-buffer window)
+  ;;                 (hobo--ensure-buffer-monitored)))))
+  )
 
 (defun hobo-stop ()
   (interactive)

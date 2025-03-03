@@ -1,11 +1,6 @@
 import * as Y from "https://cdn.skypack.dev/yjs";
-import { TextAreaBinding } from "https://cdn.skypack.dev/y-textarea";
 
 const doc = new Y.Doc();
-
-const buffer = doc.getText("*hobo*");
-
-const binding = new TextAreaBinding(buffer, $output);
 
 window.DOC = doc;
 
@@ -25,4 +20,26 @@ doc.on("update", (diff, origin) => {
   if (origin !== "server") {
     socket.send(JSON.stringify({ type: "Diff", diff: Array.from(diff) }));
   }
+
+  render();
 });
+
+function render() {
+  for (const bufferName in doc.toJSON()) {
+    let bufferEl = $root.querySelector(`[data-buffer="${bufferName}"]`);
+
+    if (!bufferEl) {
+      bufferEl = $bufferTemplate.content.cloneNode(true);
+      bufferEl.querySelector(".buffer").dataset.buffer = bufferName;
+      bufferEl.querySelector(".buffer-title").innerText = bufferName;
+
+      $root.appendChild(bufferEl);
+
+      bufferEl = $root.querySelector(`[data-buffer="${bufferName}"]`);
+    }
+
+    bufferEl.querySelector(".buffer-content").innerText = doc
+      .getText(bufferName)
+      .toString();
+  }
+}

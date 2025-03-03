@@ -8,17 +8,12 @@
   :group 'hobo
   :type 'string)
 
+(defcustom hobo-ignored-buffers '("*hobo logs*")
+  "Buffers that shouldn't be synced."
+  :group 'hobo
+  :type '(repeat string))
+
 (require 'hobors)
-
-(defun hobo--buffer-after-change (start end length)
-  (let ((text (buffer-substring-no-properties start end)))
-    (hobors--update-buffer (buffer-name) (- start 1) length text)))
-
-(defun hobo-create-buffer ()
-  (let ((buf (get-buffer-create "*hobo*")))
-    (with-current-buffer buf
-      (add-hook 'after-change-functions 'hobo--buffer-after-change nil t)
-      (display-buffer buf '(display-buffer-same-window)))))
 
 (defvar hobo-logger-process nil)
 
@@ -55,12 +50,49 @@
   (interactive)
   (display-buffer "*hobo logs*"))
 
+(defun hobo--buffer-before-kill ()
+  (hobors--kill-buffer (buffer-name)))
+
+(defvar hobo--buffer-last-state (make-hash-table :test 'equal))
+
+(defun hobo--buffer-after-change (begin end length)
+  (let ((buffer-name (buffer-name))
+        (changed-text (buffer-substring-no-properties begin end)))
+    (hobors--update-buffer buffer-name begin length changed-text)
+    (puthash buffer-name (buffer-string) hobo--buffer-last-state)))
+
+(defun hobo--verify-buffer-sync ()
+  (let* ((buffer-name (buffer-name))
+         (current-content (buffer-string))
+         (last-known-content (gethash buffer-name hobo--buffer-last-state nil)))
+    (unless (and last-known-content
+                 (string= current-content last-known-content))
+      (hobors--reset-buffer buffer-name current-content)
+      (puthash buffer-name current-content hobo--buffer-last-state))))
+
+(defun hobo--ensure-buffer-monitored ()
+  (let ((buffer-name (buffer-name)))
+    (unless (or (string-match-p "^ " buffer-name)
+                (minibufferp)
+                (member buffer-name hobo-ignored-buffers))
+      (add-hook 'after-change-functions 'hobo--buffer-after-change nil t)
+      (add-hook 'post-command-hook 'hobo--verify-buffer-sync nil t)
+      (hobo--verify-buffer-sync))))
+
 (defun hobo-start ()
   "Start the HOBO server."
   (interactive)
   (hobo-init-logger)
   (hobors--start)
-  (hobo-create-buffer))
+
+  (add-hook 'find-file-hook 'hobo--ensure-buffer-monitored)
+  (add-hook 'after-change-major-mode-hook 'hobo--ensure-buffer-monitored)
+
+  (add-hook 'window-configuration-change-hook 
+            (lambda () 
+              (dolist (window (window-list))
+                (with-current-buffer (window-buffer window)
+                  (hobo--ensure-buffer-monitored))))))
 
 (defun hobo-stop ()
   (interactive)

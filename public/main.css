@@ -1,0 +1,12 @@
+.buffer-title {
+  font-size: 14px;
+  font-family: monospace;
+}
+
+.buffer-content {
+  padding: 0.5rem;
+  background: #fafafa;
+  border: 1px solid gray;
+  overflow-x: auto;
+  max-height: 250px;
+}

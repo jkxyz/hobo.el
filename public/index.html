@@ -1,7 +1,17 @@
 <!doctype html>
 <html lang="en">
   <meta charset="utf-8" />
+  <link rel="stylesheet" href="main.css" />
   <title>HOBO</title>
-  <textarea id="$output"></textarea>
+
+  <main id="$root"></main>
+
+  <template id="$bufferTemplate">
+    <section class="buffer">
+      <h2 class="buffer-title"></h2>
+      <pre class="buffer-content"></pre>
+    </section>
+  </template>
+
   <script type="module" src="main.js"></script>
 </html>

@@ -20,4 +20,4 @@ clean:
 	cargo clean
 
 run: all
-	emacs --eval '(progn (hobo-start) (hobo-display-logs))'
+	powershell -Command { $$env:RUST_BACKTRACE="full"; emacs --eval '(progn (hobo-start) (hobo-display-logs))' }

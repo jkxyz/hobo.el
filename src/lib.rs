@@ -1,14 +1,15 @@
-use std::sync::OnceLock;
+use std::{collections::HashMap, sync::OnceLock};
 
 use axum::{
     extract::{ws::WebSocket, WebSocketUpgrade},
     routing, Router,
 };
+use emacs::FromLisp;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tower_http::services::ServeDir;
-use yrs::{updates::decoder::Decode, ReadTxn, Text, Transact};
+use yrs::{updates::decoder::Decode, Array, Map, ReadTxn, Text, Transact, WriteTxn};
 
 mod logger;
 
@@ -17,7 +18,10 @@ emacs::plugin_is_GPL_compatible!();
 emacs::use_symbols!(hobo_public_path
                     hobo_server_bind_address
                     hobo_display_error
-                    symbol_value);
+                    symbol_name
+                    symbol_value
+                    object_intervals
+                    eq);
 
 struct HoboState {
     runtime: tokio::runtime::Runtime,
@@ -33,10 +37,17 @@ static LOGGER: OnceLock<logger::TcpLoggerServer> = OnceLock::new();
 #[emacs::module(name = "hobors", separator = "--")]
 fn init(_env: &emacs::Env) -> emacs::Result<()> {
     let runtime = tokio::runtime::Runtime::new()?;
+
     let doc = yrs::Doc::with_options(yrs::Options {
         offset_kind: yrs::OffsetKind::Utf16,
         ..yrs::Options::default()
     });
+
+    {
+        let mut txn = doc.transact_mut();
+        txn.get_or_insert_array("buffers");
+        txn.commit();
+    }
 
     STATE
         .set(HoboState {
@@ -73,7 +84,7 @@ fn start(env: &emacs::Env) -> emacs::Result<()> {
 
     let public_path = get_symbol_value::<String>(env, hobo_public_path)?;
     let bind_address = get_symbol_value::<String>(env, hobo_server_bind_address)?;
-    let router = router(public_path);
+    let router = router(&public_path);
 
     runtime.block_on(async {
         let mut server_task = server_task.lock().await;
@@ -82,7 +93,7 @@ fn start(env: &emacs::Env) -> emacs::Result<()> {
             return Err(anyhow::anyhow!("Hobo already running"));
         }
 
-        let listener = TcpListener::bind(bind_address).await?;
+        let listener = TcpListener::bind(&bind_address).await?;
 
         server_task.replace(runtime.spawn(async move {
             if let Err(err) = axum::serve(listener, router).await {
@@ -97,6 +108,8 @@ fn start(env: &emacs::Env) -> emacs::Result<()> {
         "Hobo started on {}",
         get_symbol_value::<String>(env, hobo_server_bind_address)?
     ))?;
+
+    log::info!(public_path, bind_address; "Hobo started");
 
     Ok(())
 }
@@ -154,21 +167,135 @@ fn update_buffer(
     Ok(())
 }
 
+struct EmacsListIntoIterator<'e> {
+    head: emacs::Value<'e>,
+}
+
+impl<'e> Iterator for EmacsListIntoIterator<'e> {
+    type Item = emacs::Value<'e>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.head.car::<emacs::Value>() {
+            Ok(car) => {
+                if car.is_not_nil() {
+                    self.head = self.head.cdr().expect("Could not call cdr on value");
+                    Some(car)
+                } else {
+                    None
+                }
+            }
+            Err(_) => None,
+        }
+    }
+}
+
+struct EmacsList<'e>(emacs::Value<'e>);
+
+impl<'e> IntoIterator for EmacsList<'e> {
+    type Item = emacs::Value<'e>;
+    type IntoIter = EmacsListIntoIterator<'e>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        EmacsListIntoIterator { head: self.0 }
+    }
+}
+
+impl<'e> FromLisp<'e> for EmacsList<'e> {
+    fn from_lisp(value: emacs::Value<'e>) -> emacs::Result<Self> {
+        Ok(EmacsList(value))
+    }
+}
+
+#[derive(Debug)]
+struct TextPropertyInterval<'e> {
+    start: u32,
+    end: u32,
+    properties: HashMap<String, emacs::Value<'e>>,
+}
+
+#[derive(Debug)]
+struct StringWithProperties<'e> {
+    string: String,
+    properties: Vec<TextPropertyInterval<'e>>,
+}
+
+impl<'e> FromLisp<'e> for StringWithProperties<'e> {
+    fn from_lisp(value: emacs::Value<'e>) -> emacs::Result<Self> {
+        let string = String::from_lisp(value)?;
+
+        let properties = EmacsList::from_lisp(object_intervals.call(value.env, [value])?)?
+            .into_iter()
+            .map(|interval| {
+                let mut iter = EmacsList::from_lisp(interval)?.into_iter();
+
+                if let Some(start) = iter.next() {
+                    if let Some(end) = iter.next() {
+                        if let Some(properties) = iter.next() {
+                            let start = start.into_rust::<u32>()?;
+                            let end = end.into_rust::<u32>()?;
+
+                            let properties = EmacsList::from_lisp(properties)?
+                                .into_iter()
+                                .collect::<Vec<emacs::Value>>()
+                                .chunks_exact(2)
+                                .map(|c| {
+                                    Ok((
+                                        symbol_name
+                                            .call(value.env, [c[0]])?
+                                            .into_rust::<String>()?,
+                                        c[1],
+                                    ))
+                                })
+                                .collect::<Result<HashMap<String, emacs::Value>, emacs::Error>>()?;
+
+                            return Ok(TextPropertyInterval {
+                                start,
+                                end,
+                                properties,
+                            });
+                        }
+                    }
+                }
+
+                Err(anyhow::anyhow!("Failed to parse properties"))
+            })
+            .collect::<Result<Vec<TextPropertyInterval<'e>>, emacs::Error>>()?;
+
+        Ok(StringWithProperties { string, properties })
+    }
+}
+
 #[emacs::defun]
-fn reset_buffer(_env: &emacs::Env, buffer_name: String, content: String) -> emacs::Result<()> {
-    log::debug!(buffer_name, content_chars = content.chars().count(); "Resetting buffer");
+fn reset_buffer(
+    _env: &emacs::Env,
+    buffer_name: String,
+    content: StringWithProperties,
+) -> emacs::Result<()> {
+    log::debug!(buffer_name, content_chars = content.string.chars().count(); "Resetting buffer");
 
     let HoboState { doc, .. } = get_state()?;
-    let buffer = doc.get_or_insert_text(buffer_name.clone());
     let mut txn = doc.transact_mut();
+
+    let buffers = txn
+        .get_array("buffers")
+        .ok_or_else(|| anyhow::anyhow!("Doc missing buffers array"))?;
+
+    let buffer = txn.get_or_insert_text(buffer_name.clone());
     let len = buffer.len(&mut txn);
 
     if len > 0 {
         buffer.remove_range(&mut txn, 0, len);
     }
 
-    if !content.is_empty() {
-        buffer.insert(&mut txn, 0, &content);
+    if !content.string.is_empty() {
+        buffer.insert(&mut txn, 0, &content.string);
+    }
+
+    if !buffers
+        .iter(&mut txn)
+        .any(|b| b.cast::<String>().is_ok_and(|b| b == buffer_name))
+    {
+        buffers.push_front(&mut txn, yrs::In::from(buffer_name.clone()));
     }
 
     txn.commit();
@@ -183,20 +310,28 @@ fn kill_buffer(_env: &emacs::Env, buffer_name: String) -> emacs::Result<()> {
     log::info!(buffer_name; "Killing buffer");
 
     let HoboState { doc, .. } = get_state()?;
-
-    let buffer = doc.get_or_insert_text(buffer_name.clone());
-
     let mut txn = doc.transact_mut();
-    let len = buffer.len(&mut txn);
 
-    buffer.remove_range(&mut txn, 0, len);
+    let buffers = txn
+        .get_array("buffers")
+        .ok_or_else(|| anyhow::anyhow!("Doc missing buffers array"))?;
+
+    let index = buffers
+        .iter(&mut txn)
+        .enumerate()
+        .find(|(_, b)| b.clone().cast::<String>().is_ok_and(|b| b == buffer_name))
+        .map(|(index, _)| index);
+
+    if let Some(index) = index {
+        buffers.remove(&mut txn, index as u32);
+    }
 
     txn.commit();
 
     Ok(())
 }
 
-fn router(public_path: String) -> Router {
+fn router(public_path: &str) -> Router {
     Router::new()
         .route(
             "/socket",

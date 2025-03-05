@@ -1,4 +1,5 @@
 import * as Y from "https://cdn.skypack.dev/yjs";
+import { TextAreaBinding } from "https://cdn.skypack.dev/y-textarea";
 
 const doc = new Y.Doc();
 
@@ -24,22 +25,38 @@ doc.on("update", (diff, origin) => {
   render();
 });
 
+const bindings = [];
+
 function render() {
-  for (const bufferName in doc.toJSON()) {
-    let bufferEl = $root.querySelector(`[data-buffer="${bufferName}"]`);
+  const buffers = doc.getArray("buffers").toArray();
 
-    if (!bufferEl) {
-      bufferEl = $bufferTemplate.content.cloneNode(true);
-      bufferEl.querySelector(".buffer").dataset.buffer = bufferName;
-      bufferEl.querySelector(".buffer-title").innerText = bufferName;
+  for (const bufferName of buffers) {
+    if (getBufferEl(bufferName)) continue;
 
-      $root.appendChild(bufferEl);
+    const bufferEl = $bufferTemplate.content.cloneNode(true);
 
-      bufferEl = $root.querySelector(`[data-buffer="${bufferName}"]`);
-    }
+    bufferEl.querySelector(".buffer").dataset.buffer = bufferName;
+    bufferEl.querySelector(".buffer-title").innerText = bufferName;
 
-    bufferEl.querySelector(".buffer-content").innerText = doc
-      .getText(bufferName)
-      .toString();
+    $root.appendChild(bufferEl);
+
+    bindings.push(
+      new TextAreaBinding(
+        doc.getText(bufferName),
+        getBufferEl(bufferName).querySelector(".buffer-content"),
+      ),
+    );
   }
+
+  const buffersSet = new Set(buffers);
+
+  for (const bufferEl of $root.querySelectorAll("[data-buffer]")) {
+    if (!buffersSet.has(bufferEl.dataset.buffer)) {
+      bufferEl.remove();
+    }
+  }
+}
+
+function getBufferEl(bufferName) {
+  return $root.querySelector(`[data-buffer="${bufferName}"]`);
 }

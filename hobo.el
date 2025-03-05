@@ -1,14 +1,19 @@
 (defcustom hobo-public-path "C:/Users/josh/Code/hobo/public"
-  "Path to HOBO public assets directory."
+  "Path to Hobo public assets directory."
   :group 'hobo
   :type 'string)
 
 (defcustom hobo-server-bind-address "127.0.0.1:3000"
-  "Address for the HOBO server to listen on."
+  "Address for the Hobo server to listen on."
   :group 'hobo
   :type 'string)
 
-(defcustom hobo-ignored-buffers '("*hobo logs*")
+(defcustom hobo-logs-buffer-name "*hobo-logs*"
+  "The name of the Hobo logs buffer."
+  :group 'hobo
+  :type 'string)
+
+(defcustom hobo-ignored-buffers `(,hobo-logs-buffer-name)
   "Buffers that shouldn't be synced."
   :group 'hobo
   :type '(repeat string))
@@ -17,10 +22,10 @@
 
 (defvar hobo-logger-process nil)
 
-(defun hobo-init-logger ()
+(defun hobo--init-logs ()
   (when (not hobo-logger-process)
     (let ((addr (hobors--init-logger))
-          (log-buffer (get-buffer-create "*hobo logs*")))
+          (log-buffer (get-buffer-create hobo-logs-buffer-name)))
       (with-current-buffer log-buffer
         (unless (eq major-mode 'special-mode)
           (special-mode))
@@ -28,13 +33,13 @@
         (set (make-local-variable 'window-point-insertion-type) t))
       (setq hobo-logger-process
             (make-network-process
-             :name "hobo logger"
+             :name "hobo logs client"
              :buffer log-buffer
              :host (nth 0 addr)
              :service (nth 1 addr)
-             :filter #'hobo-logger-filter)))))
+             :filter #'hobo--logs-process-filter)))))
 
-(defun hobo-logger-filter (proc string)
+(defun hobo--logs-process-filter (proc string)
   (when (buffer-live-p (process-buffer proc))
     (with-current-buffer (process-buffer proc)
       (let ((inhibit-read-only t)
@@ -47,21 +52,27 @@
           (goto-char (process-mark proc)))))))
 
 (defun hobo-display-logs ()
+  "Display the Hobo logs buffer."
   (interactive)
-  (display-buffer "*hobo logs*"))
+  (display-buffer hobo-logs-buffer-name))
 
-(defun hobo--buffer-before-kill ()
-  (hobors--kill-buffer (buffer-name)))
+(defvar hobo--buffer-last-state (make-hash-table :test 'equal)
+  "A hash of buffer name to buffer string.
 
-(defvar hobo--buffer-last-state (make-hash-table :test 'equal))
+Stores the contents of sycned buffers at the time they were last synced.
+This helps to avoid expensive resets of the entire buffer contents, which
+creates very large diffs for the client, and also doesn't preserve the
+intention of the edit when resolving conflicts.")
 
 (defun hobo--buffer-after-change (begin end length)
+  "Called when a buffer change is observed through `after-change-functions'."
   (let ((buffer-name (buffer-name))
         (changed-text (buffer-substring-no-properties begin end)))
     (hobors--update-buffer buffer-name begin length changed-text)
     (puthash buffer-name (buffer-string) hobo--buffer-last-state)))
 
-(defun hobo--verify-buffer-sync ()
+(defun hobo--reset-buffer ()
+  "Reset or initialize the content of the current buffer."
   (let* ((buffer-name (buffer-name))
          (current-content (buffer-string))
          (last-known-content (gethash buffer-name hobo--buffer-last-state nil)))
@@ -70,36 +81,48 @@
       (hobors--reset-buffer buffer-name current-content)
       (puthash buffer-name current-content hobo--buffer-last-state))))
 
-(defun hobo--ensure-buffer-monitored ()
+(defun hobo--kill-buffer ()
+  "Remove the current buffer from the syned buffers."
   (let ((buffer-name (buffer-name)))
-    (unless (or (string-match-p "^ " buffer-name)
-                (minibufferp)
-                (member buffer-name hobo-ignored-buffers))
-      (add-hook 'after-change-functions 'hobo--buffer-after-change nil t)
-      (add-hook 'post-command-hook 'hobo--verify-buffer-sync nil t)
-      (hobo--verify-buffer-sync))))
+    (hobors--kill-buffer buffer-name)
+    (remhash buffer-name hobo--buffer-last-state)))
+
+(defun hobo--should-ignore-buffer-p (buffer)
+  "Return t when BUFFER should be ignored."
+  (let ((buffer-name (buffer-name buffer)))
+    (or (string-match-p "^ " buffer-name)
+        (minibufferp)
+        (member buffer-name hobo-ignored-buffers))))
+
+(defun hobo--ensure-buffer-monitored ()
+  "Ensure that the current buffer is being monitored."
+  (unless (hobo--should-ignore-buffer-p (current-buffer))
+    (add-hook 'after-change-functions 'hobo--buffer-after-change nil t)
+    (add-hook 'post-command-hook 'hobo--reset-buffer nil t)
+    (hobo--reset-buffer)))
 
 (defun hobo-start ()
-  "Start the HOBO server."
+  "Start the Hobo server."
   (interactive)
-  (hobo-init-logger)
+  (hobo--init-logs)
   (hobors--start)
 
   (add-hook 'find-file-hook 'hobo--ensure-buffer-monitored)
   (add-hook 'after-change-major-mode-hook 'hobo--ensure-buffer-monitored)
+  (add-hook 'kill-buffer-hook 'hobo--kill-buffer)
 
   (dolist (buffer (buffer-list))
     (with-current-buffer buffer
       (hobo--ensure-buffer-monitored)))
 
-  ;; (add-hook 'window-configuration-change-hook 
-  ;;           (lambda () 
-  ;;             (dolist (window (window-list))
-  ;;               (with-current-buffer (window-buffer window)
-  ;;                 (hobo--ensure-buffer-monitored)))))
-  )
+  (add-hook 'window-configuration-change-hook
+            (lambda ()
+              (dolist (window (window-list))
+                (with-current-buffer (window-buffer window)
+                  (hobo--ensure-buffer-monitored))))))
 
 (defun hobo-stop ()
+  "Stop the Hobo server."
   (interactive)
   (hobors--stop))
 

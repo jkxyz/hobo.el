@@ -1,26 +1,24 @@
+//! Helpers for working with Emacs.
+
 use std::collections::HashMap;
 
 emacs::use_symbols!(symbol_name object_intervals);
 
-struct EmacsListIntoIterator<'e> {
-    head: emacs::Value<'e>,
+pub struct EmacsListIntoIterator<'e> {
+    cdr: emacs::Value<'e>,
 }
 
 impl<'e> Iterator for EmacsListIntoIterator<'e> {
     type Item = emacs::Value<'e>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self.head.car::<emacs::Value>() {
-            Ok(car) => {
-                if car.is_not_nil() {
-                    self.head = self.head.cdr().expect("Could not call cdr on value");
-                    Some(car)
-                } else {
-                    None
-                }
-            }
-            Err(_) => None,
+        if self.cdr.is_not_nil() {
+            let car = self.cdr.car().unwrap();
+            self.cdr = self.cdr.cdr().unwrap();
+            return Some(car);
         }
+
+        None
     }
 }
 
@@ -32,7 +30,7 @@ impl<'e> IntoIterator for EmacsList<'e> {
     type IntoIter = EmacsListIntoIterator<'e>;
 
     fn into_iter(self) -> Self::IntoIter {
-        EmacsListIntoIterator { head: self.0 }
+        EmacsListIntoIterator { cdr: self.0 }
     }
 }
 
@@ -43,7 +41,7 @@ impl<'e> emacs::FromLisp<'e> for EmacsList<'e> {
 }
 
 #[derive(Debug)]
-struct TextPropertyInterval<'e> {
+pub struct TextPropertyInterval<'e> {
     start: u32,
     end: u32,
     properties: HashMap<String, emacs::Value<'e>>,
@@ -77,17 +75,17 @@ impl<'e> emacs::FromLisp<'e> for StringWithProperties<'e> {
 
                 let start = iter
                     .next()
-                    .ok_or_else(|| anyhow::anyhow!("Invalid interval"))?
+                    .ok_or_else(|| anyhow::anyhow!("Invalid interval: expected start"))?
                     .into_rust::<u32>()?;
 
                 let end = iter
                     .next()
-                    .ok_or_else(|| anyhow::anyhow!("Invalid interval"))?
+                    .ok_or_else(|| anyhow::anyhow!("Invalid interval: expected end"))?
                     .into_rust::<u32>()?;
 
                 let properties_value = iter
                     .next()
-                    .ok_or_else(|| anyhow::anyhow!("Invalid interval"))?;
+                    .ok_or_else(|| anyhow::anyhow!("Invalid interval: expected properties"))?;
 
                 let properties = EmacsList::from_lisp(properties_value)?
                     .into_iter()
@@ -101,11 +99,11 @@ impl<'e> emacs::FromLisp<'e> for StringWithProperties<'e> {
                     })
                     .collect::<Result<HashMap<String, emacs::Value>, emacs::Error>>()?;
 
-                return Ok(TextPropertyInterval {
+                Ok(TextPropertyInterval {
                     start,
                     end,
                     properties,
-                });
+                })
             })
             .collect::<Result<Vec<TextPropertyInterval<'e>>, emacs::Error>>()?;
 

@@ -1,17 +1,16 @@
-use std::{collections::HashMap, sync::OnceLock};
+use std::sync::OnceLock;
 
 use axum::{
     extract::{ws::WebSocket, WebSocketUpgrade},
     routing, Router,
 };
-use emacs::FromLisp;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tower_http::services::ServeDir;
-use yrs::{updates::decoder::Decode, Array, Map, ReadTxn, Text, Transact, WriteTxn};
+use yrs::{updates::decoder::Decode, Array, ReadTxn, Text, Transact, WriteTxn};
 
-mod logger;
+mod hobo;
 
 emacs::plugin_is_GPL_compatible!();
 
@@ -31,7 +30,7 @@ struct HoboState {
 
 static STATE: OnceLock<HoboState> = OnceLock::new();
 
-static LOGGER: OnceLock<logger::TcpLoggerServer> = OnceLock::new();
+static LOGGER: OnceLock<hobo::logger::TcpLoggerServer> = OnceLock::new();
 
 // TODO Initialize in the start function
 #[emacs::module(name = "hobors", separator = "--")]
@@ -62,7 +61,7 @@ fn init(_env: &emacs::Env) -> emacs::Result<()> {
 
 #[emacs::defun]
 fn init_logger(env: &emacs::Env) -> emacs::Result<emacs::Value<'_>> {
-    let logger = logger::TcpLoggerServer::new()?;
+    let logger = hobo::logger::TcpLoggerServer::new()?;
     let addr = logger.server_addr();
 
     logger.init(log::LevelFilter::Info)?;
@@ -167,111 +166,15 @@ fn update_buffer(
     Ok(())
 }
 
-struct EmacsListIntoIterator<'e> {
-    head: emacs::Value<'e>,
-}
-
-impl<'e> Iterator for EmacsListIntoIterator<'e> {
-    type Item = emacs::Value<'e>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.head.car::<emacs::Value>() {
-            Ok(car) => {
-                if car.is_not_nil() {
-                    self.head = self.head.cdr().expect("Could not call cdr on value");
-                    Some(car)
-                } else {
-                    None
-                }
-            }
-            Err(_) => None,
-        }
-    }
-}
-
-struct EmacsList<'e>(emacs::Value<'e>);
-
-impl<'e> IntoIterator for EmacsList<'e> {
-    type Item = emacs::Value<'e>;
-    type IntoIter = EmacsListIntoIterator<'e>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        EmacsListIntoIterator { head: self.0 }
-    }
-}
-
-impl<'e> FromLisp<'e> for EmacsList<'e> {
-    fn from_lisp(value: emacs::Value<'e>) -> emacs::Result<Self> {
-        Ok(EmacsList(value))
-    }
-}
-
-#[derive(Debug)]
-struct TextPropertyInterval<'e> {
-    start: u32,
-    end: u32,
-    properties: HashMap<String, emacs::Value<'e>>,
-}
-
-#[derive(Debug)]
-struct StringWithProperties<'e> {
-    string: String,
-    properties: Vec<TextPropertyInterval<'e>>,
-}
-
-impl<'e> FromLisp<'e> for StringWithProperties<'e> {
-    fn from_lisp(value: emacs::Value<'e>) -> emacs::Result<Self> {
-        let string = String::from_lisp(value)?;
-
-        let properties = EmacsList::from_lisp(object_intervals.call(value.env, [value])?)?
-            .into_iter()
-            .map(|interval| {
-                let mut iter = EmacsList::from_lisp(interval)?.into_iter();
-
-                if let Some(start) = iter.next() {
-                    if let Some(end) = iter.next() {
-                        if let Some(properties) = iter.next() {
-                            let start = start.into_rust::<u32>()?;
-                            let end = end.into_rust::<u32>()?;
-
-                            let properties = EmacsList::from_lisp(properties)?
-                                .into_iter()
-                                .collect::<Vec<emacs::Value>>()
-                                .chunks_exact(2)
-                                .map(|c| {
-                                    Ok((
-                                        symbol_name
-                                            .call(value.env, [c[0]])?
-                                            .into_rust::<String>()?,
-                                        c[1],
-                                    ))
-                                })
-                                .collect::<Result<HashMap<String, emacs::Value>, emacs::Error>>()?;
-
-                            return Ok(TextPropertyInterval {
-                                start,
-                                end,
-                                properties,
-                            });
-                        }
-                    }
-                }
-
-                Err(anyhow::anyhow!("Failed to parse properties"))
-            })
-            .collect::<Result<Vec<TextPropertyInterval<'e>>, emacs::Error>>()?;
-
-        Ok(StringWithProperties { string, properties })
-    }
-}
-
 #[emacs::defun]
 fn reset_buffer(
     _env: &emacs::Env,
     buffer_name: String,
-    content: StringWithProperties,
+    content: hobo::emacs::StringWithProperties,
 ) -> emacs::Result<()> {
-    log::debug!(buffer_name, content_chars = content.string.chars().count(); "Resetting buffer");
+    let buffer_string = content.string();
+
+    log::debug!(buffer_name, content_chars = buffer_string.chars().count(); "Resetting buffer");
 
     let HoboState { doc, .. } = get_state()?;
     let mut txn = doc.transact_mut();
@@ -287,8 +190,8 @@ fn reset_buffer(
         buffer.remove_range(&mut txn, 0, len);
     }
 
-    if !content.string.is_empty() {
-        buffer.insert(&mut txn, 0, &content.string);
+    if !buffer_string.is_empty() {
+        buffer.insert(&mut txn, 0, buffer_string);
     }
 
     if !buffers

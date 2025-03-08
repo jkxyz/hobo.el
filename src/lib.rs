@@ -1,4 +1,7 @@
-use std::sync::OnceLock;
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+};
 
 use axum::{
     extract::{ws::WebSocket, WebSocketUpgrade},
@@ -168,40 +171,76 @@ fn update_buffer(
 
 #[emacs::defun]
 fn reset_buffer(
-    _env: &emacs::Env,
+    env: &emacs::Env,
     buffer_name: String,
-    content: hobo::emacs::StringWithProperties,
+    buffer_string_with_properties: hobo::emacs::StringWithProperties,
 ) -> emacs::Result<()> {
-    let buffer_string = content.string();
+    let buffer_string = buffer_string_with_properties.string();
+    let intervals = buffer_string_with_properties.intervals();
+
+    log::info!("intervals: {:?}", intervals);
 
     log::debug!(buffer_name, content_chars = buffer_string.chars().count(); "Resetting buffer");
 
     let HoboState { doc, .. } = get_state()?;
-    let mut txn = doc.transact_mut();
 
-    let buffers = txn
-        .get_array("buffers")
-        .ok_or_else(|| anyhow::anyhow!("Doc missing buffers array"))?;
-
-    let buffer = txn.get_or_insert_text(buffer_name.clone());
-    let len = buffer.len(&mut txn);
-
-    if len > 0 {
-        buffer.remove_range(&mut txn, 0, len);
-    }
-
-    if !buffer_string.is_empty() {
-        buffer.insert(&mut txn, 0, buffer_string);
-    }
-
-    if !buffers
-        .iter(&mut txn)
-        .any(|b| b.cast::<String>().is_ok_and(|b| b == buffer_name))
     {
-        buffers.push_front(&mut txn, yrs::In::from(buffer_name.clone()));
-    }
+        let mut txn = doc.transact_mut();
 
-    txn.commit();
+        let buffers = txn
+            .get_array("buffers")
+            .ok_or_else(|| anyhow::anyhow!("Doc missing buffers array"))?;
+
+        let buffer = txn.get_or_insert_text(buffer_name.clone());
+        let len = buffer.len(&mut txn);
+
+        if len > 0 {
+            buffer.remove_range(&mut txn, 0, len);
+        }
+
+        if !buffer_string.is_empty() {
+            match intervals {
+                Some(intervals) => {
+                    for interval in intervals {
+                        let start = interval.start() as usize;
+                        let end = interval.end() as usize;
+                        let chunk = &buffer_string[start..end];
+
+                        let properties = interval
+                            .properties()
+                            .iter()
+                            .filter(|(k, _)| *k == "face")
+                            .map(|(k, v)| {
+                                Ok((
+                                    k.as_str().into(),
+                                    symbol_name.call(env, [*v])?.into_rust::<String>()?.into(),
+                                ))
+                            })
+                            .collect::<Result<yrs::types::Attrs, emacs::Error>>()?;
+
+                        log::info!("properties: {:?}", properties);
+
+                        buffer.insert_with_attributes(
+                            &mut txn,
+                            interval.start(),
+                            chunk,
+                            properties,
+                        );
+                    }
+                }
+                None => {
+                    buffer.insert(&mut txn, 0, buffer_string);
+                }
+            }
+        }
+
+        if !buffers
+            .iter(&mut txn)
+            .any(|b| b.cast::<String>().is_ok_and(|b| b == buffer_name))
+        {
+            buffers.push_front(&mut txn, yrs::In::from(buffer_name.clone()));
+        }
+    }
 
     log::debug!(buffer_name; "Buffer reset complete");
 

@@ -47,11 +47,25 @@ pub struct TextPropertyInterval<'e> {
     properties: HashMap<String, emacs::Value<'e>>,
 }
 
+impl<'e> TextPropertyInterval<'e> {
+    pub fn start(&self) -> u32 {
+        self.start
+    }
+
+    pub fn end(&self) -> u32 {
+        self.end
+    }
+
+    pub fn properties(&self) -> &HashMap<String, emacs::Value<'e>> {
+        &self.properties
+    }
+}
+
 /// Captures the contents and text properties of an Emacs string.
 #[derive(Debug)]
 pub struct StringWithProperties<'e> {
     string: String,
-    intervals: Vec<TextPropertyInterval<'e>>,
+    intervals: Option<Vec<TextPropertyInterval<'e>>>,
 }
 
 impl<'e> StringWithProperties<'e> {
@@ -59,54 +73,65 @@ impl<'e> StringWithProperties<'e> {
         &self.string
     }
 
-    pub fn intervals(&self) -> &[TextPropertyInterval<'e>] {
-        &self.intervals
+    pub fn intervals(&self) -> Option<&[TextPropertyInterval<'e>]> {
+        self.intervals.as_deref()
     }
 }
 
 impl<'e> emacs::FromLisp<'e> for StringWithProperties<'e> {
     fn from_lisp(value: emacs::Value<'e>) -> emacs::Result<Self> {
         let string = String::from_lisp(value)?;
+        let intervals_value = object_intervals.call(value.env, [value])?;
 
-        let intervals = EmacsList::from_lisp(object_intervals.call(value.env, [value])?)?
-            .into_iter()
-            .map(|interval| {
-                let mut iter = EmacsList::from_lisp(interval)?.into_iter();
+        if intervals_value.is_not_nil() {
+            let intervals = EmacsList::from_lisp(object_intervals.call(value.env, [value])?)?
+                .into_iter()
+                .map(|interval| {
+                    let mut iter = EmacsList::from_lisp(interval)?.into_iter();
 
-                let start = iter
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("Invalid interval: expected start"))?
-                    .into_rust::<u32>()?;
+                    let start = iter
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("Invalid interval: expected start"))?
+                        .into_rust::<u32>()?;
 
-                let end = iter
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("Invalid interval: expected end"))?
-                    .into_rust::<u32>()?;
+                    let end = iter
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("Invalid interval: expected end"))?
+                        .into_rust::<u32>()?;
 
-                let properties_value = iter
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("Invalid interval: expected properties"))?;
+                    let properties_value = iter
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("Invalid interval: expected properties"))?;
 
-                let properties = EmacsList::from_lisp(properties_value)?
-                    .into_iter()
-                    .collect::<Vec<emacs::Value>>()
-                    .chunks_exact(2)
-                    .map(|c| {
-                        Ok((
-                            symbol_name.call(value.env, [c[0]])?.into_rust::<String>()?,
-                            c[1],
-                        ))
+                    let properties = EmacsList::from_lisp(properties_value)?
+                        .into_iter()
+                        .collect::<Vec<emacs::Value>>()
+                        .chunks_exact(2)
+                        .map(|c| {
+                            Ok((
+                                symbol_name.call(value.env, [c[0]])?.into_rust::<String>()?,
+                                c[1],
+                            ))
+                        })
+                        .collect::<Result<HashMap<String, emacs::Value>, emacs::Error>>()?;
+
+                    Ok(TextPropertyInterval {
+                        start,
+                        end,
+                        properties,
                     })
-                    .collect::<Result<HashMap<String, emacs::Value>, emacs::Error>>()?;
-
-                Ok(TextPropertyInterval {
-                    start,
-                    end,
-                    properties,
                 })
-            })
-            .collect::<Result<Vec<TextPropertyInterval<'e>>, emacs::Error>>()?;
+                .collect::<Result<Vec<TextPropertyInterval<'e>>, emacs::Error>>()?;
 
-        Ok(StringWithProperties { string, intervals })
+            return Ok(StringWithProperties {
+                string,
+                intervals: Some(intervals),
+            });
+        }
+
+        Ok(StringWithProperties {
+            string,
+            intervals: None,
+        })
     }
 }

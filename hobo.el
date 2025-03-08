@@ -119,7 +119,10 @@ intention of the edit when resolving conflicts.")
             (lambda ()
               (dolist (window (window-list))
                 (with-current-buffer (window-buffer window)
-                  (hobo--ensure-buffer-monitored))))))
+                  (hobo--ensure-buffer-monitored)))))
+
+  ;; TODO Global hook to reset messages buffer
+  )
 
 (defun hobo-stop ()
   "Stop the Hobo server."
